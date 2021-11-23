@@ -121,13 +121,7 @@ pub fn validate(
         return Ok((cwt.payload, SignatureValidity::MissingSigningAlgorithm));
     }
     if !matches!(cwt.header_protected.alg, Some(EcAlg::Ecdsa256)) {
-        return Ok((
-            cwt.payload,
-            SignatureValidity::UnsupportedSigningAlgorithm(format!(
-                "{:?}",
-                cwt.header_protected.alg.unwrap()
-            )),
-        ));
+        todo!("{:?} unsupported", cwt.header_protected.alg);
     }
 
     let key = trustlist.get_key(&kid);

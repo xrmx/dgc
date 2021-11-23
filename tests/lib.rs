@@ -724,13 +724,13 @@ fn test_case(#[case] test_file: &str) {
         // if the key is RSA skip the test (only EC supported)
         let testctx_description = test_data["TESTCTX"]["DESCRIPTION"].as_str().unwrap_or("");
         // TODO: change this once RSA is supported (see #2)
-        if testctx_description.contains("RSA") {
+        /*        if testctx_description.contains("RSA") {
             assert!(matches!(
                 add_key_result,
                 Err(KeyParseError::PublicKeyParseError(_))
             ));
             return;
-        }
+        } */
 
         let (_, signature_validity) = validate(raw_hcert, &trustlist).unwrap();
         let expected_verify = test_data["EXPECTEDRESULTS"]["EXPECTEDVERIFY"]
