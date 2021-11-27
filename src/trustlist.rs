@@ -1,14 +1,53 @@
-use ring_compat::signature::ecdsa::p256::VerifyingKey;
-use std::{collections::HashMap, convert::TryFrom};
+use der_parser::oid;
+use der_parser::oid::Oid;
+use ring::signature::{UnparsedPublicKey, RSA_PSS_2048_8192_SHA256};
+use ring_compat::signature::ecdsa::p256::VerifyingKey as EcdsaP256VerifyingKey;
+use std::{collections::HashMap, convert::TryFrom, fmt};
 use thiserror::Error;
+
+use crate::Signature;
+
+pub enum Verifier {
+    EcdsaP256(EcdsaP256VerifyingKey),
+    Rsa(UnparsedPublicKey<Vec<u8>>),
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Error)]
+#[error("Verifier algorithm and signature algorithm do not match")]
+pub struct UnmatchingAlgorithm;
+
+impl Verifier {
+    pub fn verify(&self, data: &[u8], signature: &Signature) -> Result<bool, UnmatchingAlgorithm> {
+        use ring_compat::signature::Verifier;
+
+        Ok(match (self, signature) {
+            (Self::EcdsaP256(verifier), Signature::EcdsaP256(signature)) => {
+                verifier.verify(data, signature).is_ok()
+            }
+            (Self::Rsa(key), Signature::Rsa(raw_signature)) => {
+                key.verify(data, raw_signature).is_ok()
+            }
+            _ => return Err(UnmatchingAlgorithm),
+        })
+    }
+}
+
+impl fmt::Debug for Verifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EcdsaP256(key) => f.debug_tuple("EcdsaP256").field(key).finish(),
+            Self::Rsa(_) => f.debug_tuple("Rsa").field(&"[UnparsedPublicKey]").finish(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TrustList {
-    keys: HashMap<Vec<u8>, VerifyingKey>,
+    keys: HashMap<Vec<u8>, Verifier>,
 }
 
 impl TrustList {
-    pub fn get_key(&self, kid: &[u8]) -> Option<&VerifyingKey> {
+    pub fn get_key(&self, kid: &[u8]) -> Option<&Verifier> {
         self.keys.get(kid)
     }
 }
@@ -19,6 +58,8 @@ pub enum KeyParseError {
     Base64DecodeError(#[from] base64::DecodeError),
     #[error("Failed to parse X509 data: {0}")]
     X509ParseError(#[from] x509_parser::nom::Err<x509_parser::error::X509Error>),
+    #[error("Unsupported algorithm in X509 data: OID: {0}")]
+    InvalidAlgorithm(Oid<'static>),
     #[error("Cannot extract a valid public key from certificate: {0}")]
     PublicKeyParseError(String),
 }
@@ -64,35 +105,52 @@ impl TrustList {
         }
     }
 
-    pub fn add(&mut self, kid: &[u8], key: VerifyingKey) {
-        self.keys.insert(kid.to_vec(), key);
+    pub fn add_ecdsa_p256(&mut self, kid: impl Into<Vec<u8>>, key: EcdsaP256VerifyingKey) {
+        self.keys.insert(kid.into(), Verifier::EcdsaP256(key));
+    }
+
+    pub fn add_rsa(&mut self, kid: impl Into<Vec<u8>>, key: UnparsedPublicKey<Vec<u8>>) {
+        self.keys.insert(kid.into(), Verifier::Rsa(key));
     }
 
     pub fn add_key_from_certificate(
         &mut self,
-        kid: &[u8],
+        kid: impl Into<Vec<u8>>,
         base64_x509_cert: &str,
     ) -> Result<(), KeyParseError> {
+        static EC_OID: Oid = oid!(1.2.840 .10045 .2 .1);
+        static RSA_OID: Oid = oid!(1.2.840 .113549 .1 .1 .1);
+
         let decoded = base64::decode(base64_x509_cert)?;
         let (_, certificate) = x509_parser::parse_x509_certificate(decoded.as_slice())?;
-        let raw_key_bytes = certificate.public_key().subject_public_key.data;
-        let key = VerifyingKey::new(raw_key_bytes)
-            .map_err(|e| KeyParseError::PublicKeyParseError(e.to_string()))?;
-        self.keys.insert(kid.to_vec(), key);
+        let public_key = certificate.public_key();
+        let raw_key_bytes = public_key.subject_public_key.data;
+        if public_key.algorithm.algorithm == EC_OID {
+            let key = EcdsaP256VerifyingKey::new(raw_key_bytes)
+                .map_err(|e| KeyParseError::PublicKeyParseError(e.to_string()))?;
+            self.keys.insert(kid.into(), Verifier::EcdsaP256(key));
+        } else if public_key.algorithm.algorithm == RSA_OID {
+            let key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, raw_key_bytes.to_vec());
+            self.keys.insert(kid.into(), Verifier::Rsa(key));
+        } else {
+            return Err(KeyParseError::InvalidAlgorithm(
+                public_key.algorithm.algorithm.to_owned(),
+            ));
+        }
 
         Ok(())
     }
 
-    pub fn add_key_from_str(
+    pub fn add_ecdsa_p256_key_from_str(
         &mut self,
-        kid: &[u8],
+        kid: impl Into<Vec<u8>>,
         base64_der_public_key: &str,
     ) -> Result<(), KeyParseError> {
         let der_data = base64::decode(base64_der_public_key)?;
         // The last 65 bytes of are the ones needed by VerifyingKey
-        let key = VerifyingKey::new(&der_data[der_data.len() - 65..])
+        let key = EcdsaP256VerifyingKey::new(&der_data[der_data.len() - 65..])
             .map_err(|e| KeyParseError::PublicKeyParseError(e.to_string()))?;
-        self.keys.insert(kid.to_vec(), key);
+        self.keys.insert(kid.into(), Verifier::EcdsaP256(key));
 
         Ok(())
     }
@@ -133,38 +191,41 @@ impl TryFrom<serde_json::Value> for TrustList {
                 .as_str()
                 .ok_or_else(|| InvalidPublicKeyAlgorithmName(kid.clone()))?;
 
-            if pub_key_alg_name != "ECDSA" {
-                return Err(UnsupportedPublicKeyAlgorithmName(
-                    kid.clone(),
-                    String::from(pub_key_alg_name),
-                ));
+            match dbg!(pub_key_alg_name) {
+                "ECDSA" => {
+                    let named_curve = pub_key_alg
+                        .get("namedCurve")
+                        .ok_or_else(|| MissingPublicKeyAlgorithmCurve(kid.clone()))?
+                        .as_str()
+                        .ok_or_else(|| InvalidPublicKeyAlgorithmCurve(kid.clone()))?;
+
+                    if named_curve != "P-256" {
+                        return Err(UnsupportedPublicKeyAlgorithmCurve(
+                            kid.clone(),
+                            String::from(named_curve),
+                        ));
+                    }
+
+                    // "publicKeyPem" must exist and be a base64 encoded bynary string
+                    let base64_der_public_key = keydef
+                        .get("publicKeyPem")
+                        .ok_or_else(|| MissingPublicKeyPem(kid.clone()))?
+                        .as_str()
+                        .ok_or_else(|| InvalidPublicKeyPem(kid.clone()))?;
+
+                    let decoded_kid =
+                        base64::decode(kid).map_err(|e| KidBase64DecodeError(kid.clone(), e))?;
+                    trustlist
+                        .add_ecdsa_p256_key_from_str(decoded_kid.as_slice(), base64_der_public_key)
+                        .map_err(|e| KeyParseError(kid.clone(), e))?;
+                }
+                _ => {
+                    return Err(UnsupportedPublicKeyAlgorithmName(
+                        kid.clone(),
+                        String::from(pub_key_alg_name),
+                    ))
+                }
             }
-
-            let named_curve = pub_key_alg
-                .get("namedCurve")
-                .ok_or_else(|| MissingPublicKeyAlgorithmCurve(kid.clone()))?
-                .as_str()
-                .ok_or_else(|| InvalidPublicKeyAlgorithmCurve(kid.clone()))?;
-
-            if named_curve != "P-256" {
-                return Err(UnsupportedPublicKeyAlgorithmCurve(
-                    kid.clone(),
-                    String::from(named_curve),
-                ));
-            }
-
-            // "publicKeyPem" must exist and be a base64 encoded bynary string
-            let base64_der_public_key = keydef
-                .get("publicKeyPem")
-                .ok_or_else(|| MissingPublicKeyPem(kid.clone()))?
-                .as_str()
-                .ok_or_else(|| InvalidPublicKeyPem(kid.clone()))?;
-
-            let decoded_kid =
-                base64::decode(kid).map_err(|e| KidBase64DecodeError(kid.clone(), e))?;
-            trustlist
-                .add_key_from_str(decoded_kid.as_slice(), base64_der_public_key)
-                .map_err(|e| KeyParseError(kid.clone(), e))?;
         }
 
         Ok(trustlist)
@@ -182,7 +243,7 @@ mod tests {
         let base64_x509_cert = "MIIEHjCCAgagAwIBAgIUM5lJeGCHoRF1raR6cbZqDV4vPA8wDQYJKoZIhvcNAQELBQAwTjELMAkGA1UEBhMCSVQxHzAdBgNVBAoMFk1pbmlzdGVybyBkZWxsYSBTYWx1dGUxHjAcBgNVBAMMFUl0YWx5IERHQyBDU0NBIFRFU1QgMTAeFw0yMTA1MDcxNzAyMTZaFw0yMzA1MDgxNzAyMTZaME0xCzAJBgNVBAYTAklUMR8wHQYDVQQKDBZNaW5pc3Rlcm8gZGVsbGEgU2FsdXRlMR0wGwYDVQQDDBRJdGFseSBER0MgRFNDIFRFU1QgMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABDSp7t86JxAmjZFobmmu0wkii53snRuwqVWe3/g/wVz9i306XA5iXpHkRPZVUkSZmYhutMDrheg6sfwMRdql3aajgb8wgbwwHwYDVR0jBBgwFoAUS2iy4oMAoxUY87nZRidUqYg9yyMwagYDVR0fBGMwYTBfoF2gW4ZZbGRhcDovL2NhZHMuZGdjLmdvdi5pdC9DTj1JdGFseSUyMERHQyUyMENTQ0ElMjBURVNUJTIwMSxPPU1pbmlzdGVybyUyMGRlbGxhJTIwU2FsdXRlLEM9SVQwHQYDVR0OBBYEFNSEwjzu61pAMqliNhS9vzGJFqFFMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAIF74yHgzCGdor5MaqYSvkS5aog5+7u52TGggiPl78QAmIpjPO5qcYpJZVf6AoL4MpveEI/iuCUVQxBzYqlLACjSbZEbtTBPSzuhfvsf9T3MUq5cu10lkHKbFgApUDjrMUnG9SMqmQU2Cv5S4t94ec2iLmokXmhYP/JojRXt1ZMZlsw/8/lRJ8vqPUorJ/fMvOLWDE/fDxNhh3uK5UHBhRXCT8MBep4cgt9cuT9O4w1JcejSr5nsEfeo8u9Pb/h6MnmxpBSq3JbnjONVK5ak7iwCkLr5PMk09ncqG+/8Kq+qTjNC76IetS9ST6bWzTZILX4BD1BL8bHsFGgIeeCO0GqalFZAsbapnaB+36HVUZVDYOoA+VraIWECNxXViikZdjQONaeWDVhCxZ/vBl1/KLAdX3OPxRwl/jHLnaSXeqr/zYf9a8UqFrpadT0tQff/q3yH5hJRJM0P6Yp5CPIEArJRW6ovDBbp3DVF2GyAI1lFA2Trs798NN6qf7SkuySz5HSzm53g6JsLY/HLzdwJPYLObD7U+x37n+DDi4Wa6vM5xdC7FZ5IyWXuT1oAa9yM4h6nW3UvC+wNUusW6adqqtdd4F1gHPjCf5lpW5Ye1bdLUmO7TGlePmbOkzEB08Mlc6atl/vkx/crfl4dq1LZivLgPBwDzE8arIk0f2vCx1+4=";
         let mut trustlist = TrustList::new();
         assert!(trustlist
-            .add_key_from_certificate(&[1, 2, 3], base64_x509_cert)
+            .add_key_from_certificate([1, 2, 3], base64_x509_cert)
             .is_ok());
     }
 
@@ -191,7 +252,7 @@ mod tests {
         let base64_der_public_key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEt5hwD0cJUB5TeQIAaE7nLjeef0vV5mamR30kjErGOcReGe37dDrmFAeOqILajQTiBXzcnPaMxWUd9SK9ZRexzQ==";
         let mut trustlist = TrustList::new();
         trustlist
-            .add_key_from_str(&[1, 2, 3], base64_der_public_key)
+            .add_ecdsa_p256_key_from_str([1, 2, 3], base64_der_public_key)
             .unwrap();
         assert_eq!(trustlist.keys.len(), 1);
         assert!(trustlist.get_key(&[1, 2, 3]).is_some())

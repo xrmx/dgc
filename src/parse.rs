@@ -1,6 +1,6 @@
 use crate::{Cwt, CwtParseError, DgcCertContainer, EcAlg, TrustList};
 use ring_compat::signature::{ecdsa::p256::Signature, Verifier};
-use std::{convert::TryInto, fmt::Display};
+use std::{convert::TryInto, fmt::Display, ops::Not};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -120,27 +120,31 @@ pub fn validate(
     if cwt.header_protected.alg.is_none() {
         return Ok((cwt.payload, SignatureValidity::MissingSigningAlgorithm));
     }
-    if !matches!(cwt.header_protected.alg, Some(EcAlg::Ecdsa256)) {
+    if !matches!(
+        cwt.header_protected.alg,
+        Some(EcAlg::Ecdsa256 | EcAlg::Ps256)
+    ) {
         todo!("{:?} unsupported", cwt.header_protected.alg);
     }
 
-    let key = trustlist.get_key(&kid);
-    if key.is_none() {
-        return Ok((
-            cwt.payload,
-            SignatureValidity::KeyNotInTrustList(kid.clone()),
-        ));
-    }
-    let key = key.unwrap();
-    let signature: Result<Signature, _> = cwt.signature.as_slice().try_into();
-    if signature.is_err() {
-        return Ok((cwt.payload, SignatureValidity::SignatureMalformed));
-    }
+    let key = match trustlist.get_key(&kid) {
+        Some(key) => key,
+        None => {
+            return Ok((
+                cwt.payload,
+                SignatureValidity::KeyNotInTrustList(kid.clone()),
+            ));
+        }
+    };
+    let signature = match cwt.get_signature() {
+        Ok(signature) => signature,
+        Err(err) => return Ok((cwt.payload, err)),
+    };
 
-    let signature = signature.unwrap();
     if key
         .verify(cwt.make_sig_structure().as_slice(), &signature)
-        .is_err()
+        .unwrap()
+        .not()
     {
         return Ok((cwt.payload, SignatureValidity::Invalid));
     }
@@ -238,7 +242,7 @@ mod tests {
 
         let mut trustlist = TrustList::new();
         trustlist
-            .add_key_from_str(kid.as_slice(), key_data)
+            .add_ecdsa_p256_key_from_str(kid.as_slice(), key_data)
             .unwrap();
 
         let (_, signature_validity) = validate(data, &trustlist).unwrap();

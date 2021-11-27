@@ -717,7 +717,7 @@ fn test_case(#[case] test_file: &str) {
         let mut trustlist = TrustList::default();
 
         let add_key_result = trustlist.add_key_from_certificate(
-            &cwt.header_protected.kid.unwrap(),
+            &*cwt.header_protected.kid.unwrap(),
             test_data["TESTCTX"]["CERTIFICATE"].as_str().unwrap(),
         );
 

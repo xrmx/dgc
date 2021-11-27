@@ -10,7 +10,7 @@ fn main() {
     let mut trustlist = dgc::TrustList::default();
     // We add the public key in the certificate to the trustlist
     trustlist
-        .add_key_from_certificate(&key_id, signature_certificate)
+        .add_key_from_certificate(key_id, signature_certificate)
         .expect("Failed to add key from certificate");
 
     // Now we can validate the signature (this returns)

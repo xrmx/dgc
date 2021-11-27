@@ -1,8 +1,9 @@
-use crate::DgcCertContainer;
+use crate::{DgcCertContainer, SignatureValidity};
 use ciborium::{
     ser::into_writer,
     value::{Integer, Value},
 };
+use ring_compat::signature::ecdsa;
 use std::convert::{TryFrom, TryInto};
 use thiserror::Error;
 
@@ -118,7 +119,7 @@ pub struct Cwt {
     pub header_unprotected: Value,
     pub payload_raw: Vec<u8>,
     pub payload: DgcCertContainer,
-    pub signature: Vec<u8>,
+    signature: Vec<u8>,
 }
 
 impl Cwt {
@@ -151,6 +152,30 @@ impl Cwt {
         let mut sig_structure: Vec<u8> = vec![];
         into_writer(&sig_structure_cbor, &mut sig_structure).unwrap();
         sig_structure
+    }
+
+    pub fn get_signature(&self) -> Result<Signature, SignatureValidity> {
+        let raw_signature = &*self.signature;
+
+        // TODO: what about `header_unprotected`?
+        let alg = self
+            .header_protected
+            .alg
+            .as_ref()
+            .ok_or(SignatureValidity::MissingSigningAlgorithm)?;
+
+        match alg {
+            EcAlg::Ecdsa256 => {
+                let signature: ecdsa::p256::Signature = raw_signature
+                    .try_into()
+                    .map_err(|_| SignatureValidity::SignatureMalformed)?;
+
+                Ok(Signature::EcdsaP256(signature))
+            }
+            EcAlg::Ps256 => Ok(Signature::Rsa(raw_signature)),
+            // TODO: we should remove other algorithms
+            _ => panic!("unsupported signature algorithm"),
+        }
     }
 }
 
@@ -201,6 +226,12 @@ impl TryFrom<Vec<u8>> for Cwt {
     fn try_from(data: Vec<u8>) -> Result<Self, Self::Error> {
         data.as_slice().try_into()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signature<'a> {
+    EcdsaP256(ecdsa::p256::Signature),
+    Rsa(&'a [u8]),
 }
 
 #[cfg(test)]
