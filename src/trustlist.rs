@@ -1,7 +1,12 @@
 use der_parser::oid;
 use der_parser::oid::Oid;
 use ring::signature::{UnparsedPublicKey, RSA_PSS_2048_8192_SHA256};
-use ring_compat::signature::ecdsa::p256::VerifyingKey as EcdsaP256VerifyingKey;
+use ring_compat::signature::{
+    self,
+    ecdsa::{
+        p256::VerifyingKey as EcdsaP256VerifyingKey, p384::VerifyingKey as EcdsaP384VerifyingKey,
+    },
+};
 use std::{collections::HashMap, convert::TryFrom, fmt};
 use thiserror::Error;
 
@@ -9,6 +14,7 @@ use crate::Signature;
 
 pub enum Verifier {
     EcdsaP256(EcdsaP256VerifyingKey),
+    EcdsaP384(EcdsaP384VerifyingKey),
     Rsa(UnparsedPublicKey<Vec<u8>>),
 }
 
@@ -24,6 +30,9 @@ impl Verifier {
             (Self::EcdsaP256(verifier), Signature::EcdsaP256(signature)) => {
                 verifier.verify(data, signature).is_ok()
             }
+            (Self::EcdsaP384(verifier), Signature::EcdsaP384(signature)) => {
+                verifier.verify(data, signature).is_ok()
+            }
             (Self::Rsa(key), Signature::Rsa(raw_signature)) => {
                 key.verify(data, raw_signature).is_ok()
             }
@@ -36,6 +45,7 @@ impl fmt::Debug for Verifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EcdsaP256(key) => f.debug_tuple("EcdsaP256").field(key).finish(),
+            Self::EcdsaP384(key) => f.debug_tuple("EcdsaP384").field(key).finish(),
             Self::Rsa(_) => f.debug_tuple("Rsa").field(&"[UnparsedPublicKey]").finish(),
         }
     }
@@ -120,15 +130,53 @@ impl TrustList {
     ) -> Result<(), KeyParseError> {
         static EC_OID: Oid = oid!(1.2.840 .10045 .2 .1);
         static RSA_OID: Oid = oid!(1.2.840 .113549 .1 .1 .1);
+        static ECDSA_P256_OID: Oid = oid!(1.2.840 .10045 .3 .1 .7);
+        static ECDSA_P384_OID: Oid = oid!(1.3.132 .0 .34);
 
         let decoded = base64::decode(base64_x509_cert)?;
         let (_, certificate) = x509_parser::parse_x509_certificate(decoded.as_slice())?;
         let public_key = certificate.public_key();
         let raw_key_bytes = public_key.subject_public_key.data;
         if public_key.algorithm.algorithm == EC_OID {
-            let key = EcdsaP256VerifyingKey::new(raw_key_bytes)
-                .map_err(|e| KeyParseError::PublicKeyParseError(e.to_string()))?;
-            self.keys.insert(kid.into(), Verifier::EcdsaP256(key));
+            let content_oid = public_key
+                .algorithm
+                .parameters
+                .as_ref()
+                .and_then(|params| params.content.as_oid().ok());
+
+            fn get_verifier<F, G, T>(
+                bytes: &[u8],
+                verifying_key_new: F,
+                variant: G,
+            ) -> Result<Verifier, KeyParseError>
+            where
+                F: FnOnce(&[u8]) -> Result<T, signature::Error>,
+                G: FnOnce(T) -> Verifier,
+            {
+                let key = verifying_key_new(bytes)
+                    .map_err(|e| KeyParseError::PublicKeyParseError(e.to_string()))?;
+                Ok(variant(key))
+            }
+
+            let verifier = if content_oid == Some(&ECDSA_P256_OID) {
+                get_verifier(
+                    raw_key_bytes,
+                    EcdsaP256VerifyingKey::new,
+                    Verifier::EcdsaP256,
+                )?
+            } else if content_oid == Some(&ECDSA_P384_OID) {
+                get_verifier(
+                    raw_key_bytes,
+                    EcdsaP384VerifyingKey::new,
+                    Verifier::EcdsaP384,
+                )?
+            } else {
+                return Err(KeyParseError::PublicKeyParseError(
+                    "Unknown public key content OID".to_string(),
+                ));
+            };
+
+            self.keys.insert(kid.into(), verifier);
         } else if public_key.algorithm.algorithm == RSA_OID {
             let key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, raw_key_bytes.to_vec());
             self.keys.insert(kid.into(), Verifier::Rsa(key));
@@ -191,7 +239,7 @@ impl TryFrom<serde_json::Value> for TrustList {
                 .as_str()
                 .ok_or_else(|| InvalidPublicKeyAlgorithmName(kid.clone()))?;
 
-            match dbg!(pub_key_alg_name) {
+            match pub_key_alg_name {
                 "ECDSA" => {
                     let named_curve = pub_key_alg
                         .get("namedCurve")

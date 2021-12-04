@@ -122,7 +122,7 @@ pub fn validate(
     }
     if !matches!(
         cwt.header_protected.alg,
-        Some(EcAlg::Ecdsa256 | EcAlg::Ps256)
+        Some(EcAlg::Ecdsa256 | EcAlg::Ecdsa384 | EcAlg::Ps256)
     ) {
         todo!("{:?} unsupported", cwt.header_protected.alg);
     }

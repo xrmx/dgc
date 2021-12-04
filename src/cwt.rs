@@ -172,6 +172,13 @@ impl Cwt {
 
                 Ok(Signature::EcdsaP256(signature))
             }
+            EcAlg::Ecdsa384 => {
+                let signature: ecdsa::p384::Signature = raw_signature
+                    .try_into()
+                    .map_err(|_| SignatureValidity::SignatureMalformed)?;
+
+                Ok(Signature::EcdsaP384(signature))
+            }
             EcAlg::Ps256 => Ok(Signature::Rsa(raw_signature)),
             // TODO: we should remove other algorithms
             _ => panic!("unsupported signature algorithm"),
@@ -231,6 +238,7 @@ impl TryFrom<Vec<u8>> for Cwt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signature<'a> {
     EcdsaP256(ecdsa::p256::Signature),
+    EcdsaP384(ecdsa::p384::Signature),
     Rsa(&'a [u8]),
 }
 
